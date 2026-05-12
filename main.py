@@ -75,6 +75,7 @@ SMOOTH_WINDOW = 5  # Anzahl der letzten Messwerte, über die der gleitende Mitte
 # --- Label-Bezeichnungen (müssen exakt mit labels.txt übereinstimmen) ---
 LABEL_RED   = "1 Rot"    # Label für roten Farbblock → Linksabbiegen
 LABEL_GREEN = "2 Grün"   # Label für grünen Farbblock → Rechtsabbiegen
+LABEL_LINE  = "3 Linie"  # Label für Ecklinie → Abbiegen je nach Wandabstand (links/rechts)
 
 
 # =========================================================
@@ -332,20 +333,36 @@ def main(argv):
                 turn_max_time   = now + BLOCK_TURN_MAX_DURATION
                 last_turn_time  = now
 
+            elif best_label == LABEL_LINE:
+                # Ecklinie erkannt → Abbiegerichtung anhand des Wandabstands bestimmen:
+                # Seite mit mehr Platz = Richtung, in die abgebogen werden soll
+                if left_avg >= right_avg:
+                    print(">>> LINIE ERKANNT → LINKS ABBIEGEN")
+                    turn_left_mode  = True
+                else:
+                    print(">>> LINIE ERKANNT → RECHTS ABBIEGEN")
+                    turn_right_mode = True
+                turn_end_time  = now + BLOCK_TURN_MIN_DURATION
+                turn_max_time  = now + BLOCK_TURN_MAX_DURATION
+                last_turn_time = now
+
         # =================================================
         # LINKS ABBIEGEN (Rot-Klotz)
         # =================================================
 
         if turn_left_mode:
             print("turn_left_mode")
-            # Prüfen, ob der rote Block noch im Bild sichtbar ist
-            block_still_visible = (best_label == LABEL_RED and best_score >= DETECTION_THRESHOLD)
+            # Prüfen, ob das erkannte Objekt (roter Block oder Ecklinie) noch sichtbar ist
+            target_still_visible = (
+                best_score >= DETECTION_THRESHOLD
+                and best_label in (LABEL_RED, LABEL_LINE)
+            )
 
-            if block_still_visible:
+            if target_still_visible:
                 # Proportional: höhere Konfidenz (= näher) → stärkerer Lenkeinschlag nach links
                 steering = int(CENTER + (MAX_STEERING - CENTER) * block_score_factor(best_score))
             else:
-                # Block temporär verdeckt (z. B. durch Karosserie) – voller Einschlag beibehalten
+                # Objekt temporär verdeckt (z. B. durch Karosserie) – voller Einschlag beibehalten
                 steering = MAX_STEERING
 
             # Lenkwinkel auf gültigen Bereich begrenzen und Servo setzen
@@ -355,8 +372,8 @@ def main(argv):
             TXT_M_M1_encodermotor.set_speed(int(CURVE_SPEED), Motor.CCW)
             TXT_M_M1_encodermotor.set_distance(int(100))
 
-            # Abbiegung beenden, wenn Block verschwunden (nach Mindestzeit) oder Sicherheits-Timeout
-            if (now > turn_end_time and not block_still_visible) or now > turn_max_time:
+            # Abbiegung beenden, wenn Objekt verschwunden (nach Mindestzeit) oder Sicherheits-Timeout
+            if (now > turn_end_time and not target_still_visible) or now > turn_max_time:
                 turn_left_mode     = False
                 straighten_mode    = True                         # Geradeausphase starten
                 straighten_end_time = now + STRAIGHTEN_DURATION
@@ -367,14 +384,17 @@ def main(argv):
 
         elif turn_right_mode:
             print("turn_right_mode")
-            # Prüfen, ob der grüne Block noch im Bild sichtbar ist
-            block_still_visible = (best_label == LABEL_GREEN and best_score >= DETECTION_THRESHOLD)
+            # Prüfen, ob das erkannte Objekt (grüner Block oder Ecklinie) noch sichtbar ist
+            target_still_visible = (
+                best_score >= DETECTION_THRESHOLD
+                and best_label in (LABEL_GREEN, LABEL_LINE)
+            )
 
-            if block_still_visible:
+            if target_still_visible:
                 # Proportional: höhere Konfidenz (= näher) → stärkerer Lenkeinschlag nach rechts
                 steering = int(CENTER - (CENTER - MIN_STEERING) * block_score_factor(best_score))
             else:
-                # Block temporär verdeckt – voller Einschlag beibehalten
+                # Objekt temporär verdeckt – voller Einschlag beibehalten
                 steering = MIN_STEERING
 
             # Lenkwinkel auf gültigen Bereich begrenzen und Servo setzen
@@ -383,8 +403,8 @@ def main(argv):
             TXT_M_M1_encodermotor.set_speed(int(CURVE_SPEED), Motor.CCW)
             TXT_M_M1_encodermotor.set_distance(int(100))
 
-            # Abbiegung beenden, wenn Block verschwunden (nach Mindestzeit) oder Sicherheits-Timeout
-            if (now > turn_end_time and not block_still_visible) or now > turn_max_time:
+            # Abbiegung beenden, wenn Objekt verschwunden (nach Mindestzeit) oder Sicherheits-Timeout
+            if (now > turn_end_time and not target_still_visible) or now > turn_max_time:
                 turn_right_mode    = False
                 straighten_mode    = True                         # Geradeausphase starten
                 straighten_end_time = now + STRAIGHTEN_DURATION
