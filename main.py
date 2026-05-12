@@ -30,15 +30,17 @@ CAMERA_HEIGHT = 240
 DETECTION_THRESHOLD = 0.70  # Mindest-Konfidenz für Farberkennung
 
 # Kurven-Timing (Sekunden)
-TURN_DURATION      = 2.5   # Dauer des Lenkeinschlags beim Abbiegen
-STRAIGHTEN_DURATION = 0.3  # Kurze Geradeausphase nach dem Abbiegen
-TURN_COOLDOWN      = 4.0   # Sperrzeit nach einer Kurve (kein Re-Trigger)
+BLOCK_TURN_MIN_DURATION = 0.3   # Mindestlenkzeit bevor Sichtbarkeit geprüft wird
+BLOCK_TURN_MAX_DURATION = 4.0   # Maximale Sicherheits-Lenkdauer (Notfall-Timeout)
+STRAIGHTEN_DURATION      = 0.3  # Kurze Geradeausphase nach dem Abbiegen
+TURN_COOLDOWN            = 4.0  # Sperrzeit nach einer Kurve (kein Re-Trigger)
 
 # Wandverfolgung
 WALL_TOLERANCE          = 3     # cm Toleranz links/rechts bevor korrigiert wird
 WALL_CORRECTION_DURATION = 0.10  # Sekunden mit Lenkkorrektur
 WALL_STRAIGHT_DURATION  = 0.08  # Sekunden Geradeaus zum Stabilisieren
 WALL_MIN                = 10    # Mindestwert für Ultraschall-Sensor (ersetzt <=0)
+WALL_KP                 = 5.0   # Proportional-Faktor Wandkorrektur (cm Fehler → Lenkeinheiten)
 
 # Glättungsfenster für Sensorwerte
 SMOOTH_WINDOW = 5
@@ -61,6 +63,14 @@ def load_model(model_path):
     interpreter = tflite.Interpreter(model_path=model_path, num_threads=4)
     interpreter.allocate_tensors()
     return interpreter
+
+
+def block_score_factor(score):
+    """Normiert den Erkennungswert auf [0, 1] relativ zum Schwellenwert."""
+    span = 1.0 - DETECTION_THRESHOLD
+    if span <= 0:
+        return 1.0
+    return max(0.0, min((score - DETECTION_THRESHOLD) / span, 1.0))
 
 
 def process_image(interpreter, image, input_index, input_details, k=3):
@@ -120,6 +130,7 @@ def main(argv):
     turn_left_mode  = False
     turn_right_mode = False
     turn_end_time   = 0.0
+    turn_max_time   = 0.0
 
     # Kurze Geradeausphase nach dem Abbiegen
     straighten_mode    = False
@@ -195,13 +206,15 @@ def main(argv):
             if best_label == LABEL_RED:
                 print(">>> ROT ERKANNT → LINKS ABBIEGEN")
                 turn_left_mode = True
-                turn_end_time  = now + TURN_DURATION
+                turn_end_time  = now + BLOCK_TURN_MIN_DURATION
+                turn_max_time  = now + BLOCK_TURN_MAX_DURATION
                 last_turn_time = now
 
             elif best_label == LABEL_GREEN:
                 print(">>> GRÜN ERKANNT → RECHTS ABBIEGEN")
                 turn_right_mode = True
-                turn_end_time   = now + TURN_DURATION
+                turn_end_time   = now + BLOCK_TURN_MIN_DURATION
+                turn_max_time   = now + BLOCK_TURN_MAX_DURATION
                 last_turn_time  = now
 
         # =================================================
@@ -210,13 +223,21 @@ def main(argv):
 
         if turn_left_mode:
             print("turn_left_mode")
-            steering = MAX_STEERING  # 382 = voller Linkslenkeinschlag
+            block_still_visible = (best_label == LABEL_RED and best_score >= DETECTION_THRESHOLD)
 
+            if block_still_visible:
+                # Proportional: höhere Konfidenz (= näher) → stärkerer Lenkeinschlag
+                steering = int(CENTER + (MAX_STEERING - CENTER) * block_score_factor(best_score))
+            else:
+                steering = MAX_STEERING  # Klotz temporär verdeckt – voller Einschlag beibehalten
+
+            steering = max(MIN_STEERING, min(steering, MAX_STEERING))
             TXT_M_S1_servomotor.set_position(int(steering))
             TXT_M_M1_encodermotor.set_speed(int(CURVE_SPEED), Motor.CCW)
             TXT_M_M1_encodermotor.set_distance(int(100))
 
-            if now > turn_end_time:
+            # Beenden wenn Klotz nicht mehr sichtbar (nach Mindestzeit) oder Sicherheits-Timeout
+            if (now > turn_end_time and not block_still_visible) or now > turn_max_time:
                 turn_left_mode     = False
                 straighten_mode    = True
                 straighten_end_time = now + STRAIGHTEN_DURATION
@@ -227,13 +248,21 @@ def main(argv):
 
         elif turn_right_mode:
             print("turn_right_mode")
-            steering = MIN_STEERING  # 182 = voller Rechtslenkeinschlag
+            block_still_visible = (best_label == LABEL_GREEN and best_score >= DETECTION_THRESHOLD)
 
+            if block_still_visible:
+                # Proportional: höhere Konfidenz (= näher) → stärkerer Lenkeinschlag
+                steering = int(CENTER - (CENTER - MIN_STEERING) * block_score_factor(best_score))
+            else:
+                steering = MIN_STEERING  # Klotz temporär verdeckt – voller Einschlag beibehalten
+
+            steering = max(MIN_STEERING, min(steering, MAX_STEERING))
             TXT_M_S1_servomotor.set_position(int(steering))
             TXT_M_M1_encodermotor.set_speed(int(CURVE_SPEED), Motor.CCW)
             TXT_M_M1_encodermotor.set_distance(int(100))
 
-            if now > turn_end_time:
+            # Beenden wenn Klotz nicht mehr sichtbar (nach Mindestzeit) oder Sicherheits-Timeout
+            if (now > turn_end_time and not block_still_visible) or now > turn_max_time:
                 turn_right_mode    = False
                 straighten_mode    = True
                 straighten_end_time = now + STRAIGHTEN_DURATION
@@ -293,16 +322,18 @@ def main(argv):
                     print("steering=center")
 
                 elif error > 0:
-                    # Linke Wand weiter entfernt → Roboter zu nah an rechter Wand → nach links korrigieren
-                    steering = CENTER + 40
-                    print("steering=links +40")
+                    # Linke Wand weiter entfernt → zu nah an rechter Wand → nach links korrigieren
+                    correction = min(int(abs(error) * WALL_KP), MAX_STEERING - CENTER)
+                    steering = CENTER + correction
+                    print(f"steering=links +{correction}")
                     wall_correction_mode = True
                     wall_correction_end  = now + WALL_CORRECTION_DURATION
 
                 else:
-                    # Rechte Wand weiter entfernt → Roboter zu nah an linker Wand → nach rechts korrigieren
-                    steering = CENTER - 40
-                    print("steering=rechts -40")
+                    # Rechte Wand weiter entfernt → zu nah an linker Wand → nach rechts korrigieren
+                    correction = min(int(abs(error) * WALL_KP), CENTER - MIN_STEERING)
+                    steering = CENTER - correction
+                    print(f"steering=rechts -{correction}")
                     wall_correction_mode = True
                     wall_correction_end  = now + WALL_CORRECTION_DURATION
 
