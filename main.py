@@ -5,7 +5,7 @@ Dieses Skript steuert ein autonomes Modellfahrzeug auf Basis eines
 Fischertechnik-TXT-Controllers. Es kombiniert:
   - Ultraschall-Wandverfolgung (links/rechts) für die Spurhaltung
   - KI-gestützte Farbblock-Erkennung (rot/grün) über TensorFlow Lite
-    für gezielte Links-/Rechtsabbiegungen
+    für gezielte Rechts-/Linksabbiegungen
   - Einen Servo für die Lenkung und einen Encoder-Motor für den Antrieb
 
 Ablauf pro Schleifendurchlauf:
@@ -72,10 +72,14 @@ WALL_KP                 = 5.0   # Proportional-Verstärkung: cm Abweichung → L
 # --- Sensorglättung ---
 SMOOTH_WINDOW = 5  # Anzahl der letzten Messwerte, über die der gleitende Mittelwert gebildet wird
 
+# --- Fahrtrichtung ---
+# "ccw" = gegen den Uhrzeigersinn, "cw" = im Uhrzeigersinn
+DRIVE_DIRECTION = "ccw"
+
 # --- Label-Bezeichnungen (müssen exakt mit labels.txt übereinstimmen) ---
-LABEL_RED   = "1 Rot"    # Label für roten Farbblock → Linksabbiegen
-LABEL_GREEN = "2 Grün"   # Label für grünen Farbblock → Rechtsabbiegen
-LABEL_LINE  = "3 Linie"  # Label für Ecklinie → Abbiegen je nach Wandabstand (links/rechts)
+LABEL_RED   = "1 Rot"    # Label für roten Farbblock → rechts am Block vorbeifahren
+LABEL_GREEN = "2 Grün"   # Label für grünen Farbblock → links am Block vorbeifahren
+LABEL_LINE  = "3 Linie"  # Label für Ecklinie → Abbiegen abhängig von DRIVE_DIRECTION
 
 
 # =========================================================
@@ -221,7 +225,7 @@ def main(argv):
     right_values = []  # Letzte SMOOTH_WINDOW Messwerte des rechten Sensors
 
     # Abbiegemodi: werden aktiviert, wenn ein Farbblock erkannt wird
-    # (Rot → links, Grün → rechts)
+    # (Rot → rechts am Block vorbei, Grün → links am Block vorbei)
     turn_left_mode  = False  # Aktiv während Linksabbiegung
     turn_right_mode = False  # Aktiv während Rechtsabbiegung
     turn_end_time   = 0.0    # Zeitpunkt, ab dem Sichtbarkeit geprüft wird
@@ -240,6 +244,12 @@ def main(argv):
 
     # Zeitstempel der zuletzt abgeschlossenen Kurve (für TURN_COOLDOWN)
     last_turn_time = 0.0
+
+    # Fahrtrichtung für Linien-Erkennung absichern
+    drive_direction = DRIVE_DIRECTION.strip().lower()
+    if drive_direction not in ("cw", "ccw"):
+        print(f"Ungültige DRIVE_DIRECTION '{DRIVE_DIRECTION}', fallback auf 'ccw'")
+        drive_direction = "ccw"
 
     # =====================================================
     # HAUPTSCHLEIFE
@@ -318,30 +328,29 @@ def main(argv):
         # Nur wenn alle Bedingungen erfüllt und ein Block mit ausreichender Konfidenz erkannt:
         if cooldown_ok and not_in_turn and best_score >= DETECTION_THRESHOLD:
             if best_label == LABEL_RED:
-                # Roter Block erkannt → Linksabbiegung einleiten
-                print(">>> ROT ERKANNT → LINKS ABBIEGEN")
-                turn_left_mode = True
+                # Roter Block erkannt → rechts am Block vorbeifahren
+                print(">>> ROT ERKANNT → RECHTS ABBIEGEN")
+                turn_right_mode = True
                 turn_end_time  = now + BLOCK_TURN_MIN_DURATION  # Frühester Zeitpunkt für Beendigung
                 turn_max_time  = now + BLOCK_TURN_MAX_DURATION  # Sicherheits-Timeout
                 last_turn_time = now                             # Cooldown-Uhr starten
 
             elif best_label == LABEL_GREEN:
-                # Grüner Block erkannt → Rechtsabbiegung einleiten
-                print(">>> GRÜN ERKANNT → RECHTS ABBIEGEN")
-                turn_right_mode = True
+                # Grüner Block erkannt → links am Block vorbeifahren
+                print(">>> GRÜN ERKANNT → LINKS ABBIEGEN")
+                turn_left_mode = True
                 turn_end_time   = now + BLOCK_TURN_MIN_DURATION
                 turn_max_time   = now + BLOCK_TURN_MAX_DURATION
                 last_turn_time  = now
 
             elif best_label == LABEL_LINE:
-                # Ecklinie erkannt → Abbiegerichtung anhand des Wandabstands bestimmen:
-                # Seite mit mehr Platz = Richtung, in die abgebogen werden soll
-                if left_avg >= right_avg:
-                    print(">>> LINIE ERKANNT → LINKS ABBIEGEN")
-                    turn_left_mode  = True
-                else:
-                    print(">>> LINIE ERKANNT → RECHTS ABBIEGEN")
+                # Ecklinie erkannt → Richtung abhängig von der gewünschten Fahrtrichtung
+                if drive_direction == "cw":
+                    print(">>> LINIE ERKANNT (CW) → RECHTS ABBIEGEN")
                     turn_right_mode = True
+                else:
+                    print(">>> LINIE ERKANNT (CCW) → LINKS ABBIEGEN")
+                    turn_left_mode  = True
                 turn_end_time  = now + BLOCK_TURN_MIN_DURATION
                 turn_max_time  = now + BLOCK_TURN_MAX_DURATION
                 last_turn_time = now
@@ -352,10 +361,10 @@ def main(argv):
 
         if turn_left_mode:
             print("turn_left_mode")
-            # Prüfen, ob das erkannte Objekt (roter Block oder Ecklinie) noch sichtbar ist
+            # Prüfen, ob das erkannte Objekt (grüner Block oder Ecklinie) noch sichtbar ist
             target_still_visible = (
                 best_score >= DETECTION_THRESHOLD
-                and best_label in (LABEL_RED, LABEL_LINE)
+                and best_label in (LABEL_GREEN, LABEL_LINE)
             )
 
             if target_still_visible:
@@ -384,10 +393,10 @@ def main(argv):
 
         elif turn_right_mode:
             print("turn_right_mode")
-            # Prüfen, ob das erkannte Objekt (grüner Block oder Ecklinie) noch sichtbar ist
+            # Prüfen, ob das erkannte Objekt (roter Block oder Ecklinie) noch sichtbar ist
             target_still_visible = (
                 best_score >= DETECTION_THRESHOLD
-                and best_label in (LABEL_GREEN, LABEL_LINE)
+                and best_label in (LABEL_RED, LABEL_LINE)
             )
 
             if target_still_visible:
