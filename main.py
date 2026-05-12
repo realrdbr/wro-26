@@ -69,17 +69,16 @@ WALL_STRAIGHT_DURATION  = 0.08  # Kurze Geradeausphase nach der Korrektur, um de
 WALL_MIN                = 10    # Mindestwert für Ultraschall-Messung; ersetzt ungültige Werte ≤ 0
 WALL_KP                 = 5.0   # Proportional-Verstärkung: cm Abweichung → Lenkeinheiten
 
-# --- Sensorglättung ---
-SMOOTH_WINDOW = 5  # Anzahl der letzten Messwerte, über die der gleitende Mittelwert gebildet wird
-
-# --- Fahrtrichtung ---
-# "ccw" = gegen den Uhrzeigersinn, "cw" = im Uhrzeigersinn
-DRIVE_DIRECTION = "ccw"
+# --- Ultraschall-Entscheidung für Kurvenrichtung ---
+LINE_TURN_DECISION_GAP = 2.0  # Mindestdifferenz links/rechts in cm für sichere Richtungsentscheidung
 
 # --- Label-Bezeichnungen (müssen exakt mit labels.txt übereinstimmen) ---
 LABEL_RED   = "1 Rot"    # Label für roten Farbblock → rechts am Block vorbeifahren
 LABEL_GREEN = "2 Grün"   # Label für grünen Farbblock → links am Block vorbeifahren
-LABEL_LINE  = "3 Linie"  # Label für Ecklinie → Abbiegen abhängig von DRIVE_DIRECTION
+LABEL_LINE  = "3 Linie"  # Label für Ecklinie → Abbiegen per Ultraschall-Entscheidung
+
+# --- Sensorglättung ---
+SMOOTH_WINDOW = 5  # Anzahl der letzten Messwerte, über die der gleitende Mittelwert gebildet wird
 
 
 # =========================================================
@@ -133,6 +132,28 @@ def block_score_factor(score):
     if span <= 0:
         return 1.0  # Sonderfall: Schwelle = 1.0 → immer maximaler Einschlag
     return max(0.0, min((score - DETECTION_THRESHOLD) / span, 1.0))
+
+
+def choose_line_turn_direction(left_avg, right_avg, last_direction):
+    """Bestimmt die Kurvenrichtung aus Ultraschall-Abständen links/rechts.
+
+    Args:
+        left_avg (float): Geglätteter Abstand des linken Ultraschall-Sensors in cm.
+        right_avg (float): Geglätteter Abstand des rechten Ultraschall-Sensors in cm.
+        last_direction (str | None): Zuletzt gewählte Richtung ("left"/"right")
+            als Fallback bei nahezu identischen Sensorwerten.
+
+    Returns:
+        str: "left" oder "right" als Zielrichtung für die Kurve.
+    """
+    delta = left_avg - right_avg
+    if delta > LINE_TURN_DECISION_GAP:
+        return "left"
+    if delta < -LINE_TURN_DECISION_GAP:
+        return "right"
+    if last_direction in ("left", "right"):
+        return last_direction
+    return "left" if left_avg >= right_avg else "right"
 
 
 def process_image(interpreter, image, input_index, input_details, k=3):
@@ -245,11 +266,8 @@ def main(argv):
     # Zeitstempel der zuletzt abgeschlossenen Kurve (für TURN_COOLDOWN)
     last_turn_time = 0.0
 
-    # Fahrtrichtung für Linien-Erkennung absichern
-    drive_direction = DRIVE_DIRECTION.strip().lower()
-    if drive_direction not in ("cw", "ccw"):
-        print(f"Ungültige DRIVE_DIRECTION '{DRIVE_DIRECTION}', fallback auf 'ccw'")
-        drive_direction = "ccw"
+    # Zuletzt verwendete Linien-Kurvenrichtung (Fallback bei nahezu gleichen Sensorwerten)
+    last_line_turn_direction = None
 
     # =====================================================
     # HAUPTSCHLEIFE
@@ -344,13 +362,17 @@ def main(argv):
                 last_turn_time  = now
 
             elif best_label == LABEL_LINE:
-                # Ecklinie erkannt → Richtung abhängig von der gewünschten Fahrtrichtung
-                if drive_direction == "cw":
-                    print(">>> LINIE ERKANNT (CW) → RECHTS ABBIEGEN")
+                # Ecklinie erkannt → Richtung aus Ultraschall links/rechts bestimmen
+                line_turn_direction = choose_line_turn_direction(
+                    left_avg, right_avg, last_line_turn_direction
+                )
+                if line_turn_direction == "right":
+                    print(">>> LINIE ERKANNT (US) → RECHTS ABBIEGEN")
                     turn_right_mode = True
                 else:
-                    print(">>> LINIE ERKANNT (CCW) → LINKS ABBIEGEN")
+                    print(">>> LINIE ERKANNT (US) → LINKS ABBIEGEN")
                     turn_left_mode  = True
+                last_line_turn_direction = line_turn_direction
                 turn_end_time  = now + BLOCK_TURN_MIN_DURATION
                 turn_max_time  = now + BLOCK_TURN_MAX_DURATION
                 last_turn_time = now
