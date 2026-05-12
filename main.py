@@ -76,6 +76,7 @@ LINE_TURN_DECISION_GAP = 2.0  # Mindestdifferenz links/rechts in cm für sichere
 LABEL_RED   = "1 Rot"    # Label für roten Farbblock → rechts am Block vorbeifahren
 LABEL_GREEN = "2 Grün"   # Label für grünen Farbblock → links am Block vorbeifahren
 LABEL_LINE  = "3 Linie"  # Label für Ecklinie → Abbiegen per Ultraschall-Entscheidung
+LABEL_EMPTY = "4 Leer"   # Label für leeres Bild → keine Sonderaktion, Spurhaltung bleibt aktiv
 
 # --- Sensorglättung ---
 SMOOTH_WINDOW = 5  # Anzahl der letzten Messwerte, über die der gleitende Mittelwert gebildet wird
@@ -376,6 +377,10 @@ def main(argv):
                 turn_end_time  = now + BLOCK_TURN_MIN_DURATION
                 turn_max_time  = now + BLOCK_TURN_MAX_DURATION
                 last_turn_time = now
+
+            elif best_label == LABEL_EMPTY:
+                # Leeres Bild erkannt → keine Sonderaktion; Spurhaltung (Wandverfolgung) bleibt aktiv
+                print(">>> LEER ERKANNT → SPURHALTUNG AKTIV")
 
         # =================================================
         # LINKS ABBIEGEN (Rot-Klotz)
