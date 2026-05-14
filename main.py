@@ -271,10 +271,19 @@ def main(argv):
     # Zuletzt verwendete Linien-Kurvenrichtung (Fallback bei nahezu gleichen Sensorwerten)
     last_line_turn_direction = None
 
+    # Initiale Ultraschall-Messung für gültige Startwerte
+    left = TXT_M_I1_ultrasonic_distance_meter.get_distance()
+    right = TXT_M_I2_ultrasonic_distance_meter.get_distance()
+    if left <= 0:
+        left = WALL_MIN
+    if right <= 0:
+        right = WALL_MIN
+    left_values.append(left)
+    right_values.append(right)
+    left_avg = float(left)
+    right_avg = float(right)
     # Zeitbasierte Ultraschall-Abtastung: letzte geglättete Werte zwischen Abtastungen wiederverwenden
-    last_sensor_sample_time = 0.0
-    left_avg = float(WALL_MIN)
-    right_avg = float(WALL_MIN)
+    last_sensor_sample_time = time.time()
 
     # =====================================================
     # HAUPTSCHLEIFE
