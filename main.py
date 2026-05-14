@@ -280,8 +280,8 @@ def main(argv):
         right = WALL_MIN
     left_values.append(left)
     right_values.append(right)
-    left_avg = float(left)
-    right_avg = float(right)
+    left_avg = left
+    right_avg = right
     # Zeitbasierte Ultraschall-Abtastung: letzte geglättete Werte zwischen Abtastungen wiederverwenden
     last_sensor_sample_time = time.time()
 
