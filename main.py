@@ -80,6 +80,7 @@ LABEL_EMPTY = "4 Leer"   # Label für leeres Bild → keine Sonderaktion, Spurha
 
 # --- Sensorglättung ---
 SMOOTH_WINDOW = 5  # Anzahl der letzten Messwerte, über die der gleitende Mittelwert gebildet wird
+SENSOR_SAMPLE_INTERVAL = 0.010  # Ultraschall-Abtastintervall in Sekunden (10 ms)
 
 
 # =========================================================
@@ -270,6 +271,11 @@ def main(argv):
     # Zuletzt verwendete Linien-Kurvenrichtung (Fallback bei nahezu gleichen Sensorwerten)
     last_line_turn_direction = None
 
+    # Zeitbasierte Ultraschall-Abtastung: letzte geglättete Werte zwischen Abtastungen wiederverwenden
+    last_sensor_sample_time = 0.0
+    left_avg = float(WALL_MIN)
+    right_avg = float(WALL_MIN)
+
     # =====================================================
     # HAUPTSCHLEIFE
     # =====================================================
@@ -280,28 +286,32 @@ def main(argv):
         # SENSORWERTE LESEN
         # =================================================
 
-        # Rohmesswerte von den Ultraschall-Abstandssensoren auslesen
-        left  = TXT_M_I1_ultrasonic_distance_meter.get_distance()  # Linker Sensor (cm)
-        right = TXT_M_I2_ultrasonic_distance_meter.get_distance()  # Rechter Sensor (cm)
+        # Ultraschall nur alle SENSOR_SAMPLE_INTERVAL neu lesen; dazwischen letzte geglättete Werte nutzen
+        if now - last_sensor_sample_time >= SENSOR_SAMPLE_INTERVAL:
+            last_sensor_sample_time = now
 
-        # Ungültige Messwerte (Sensor nicht im Messbereich) durch Mindestwert ersetzen
-        if left  <= 0:
-            left  = WALL_MIN
-        if right <= 0:
-            right = WALL_MIN
+            # Rohmesswerte von den Ultraschall-Abstandssensoren auslesen
+            left  = TXT_M_I1_ultrasonic_distance_meter.get_distance()  # Linker Sensor (cm)
+            right = TXT_M_I2_ultrasonic_distance_meter.get_distance()  # Rechter Sensor (cm)
 
-        # Neue Werte in die Glättungspuffer aufnehmen
-        left_values.append(left)
-        right_values.append(right)
+            # Ungültige Messwerte (Sensor nicht im Messbereich) durch Mindestwert ersetzen
+            if left  <= 0:
+                left  = WALL_MIN
+            if right <= 0:
+                right = WALL_MIN
 
-        # Puffer auf SMOOTH_WINDOW begrenzen (älteste Werte entfernen)
-        if len(left_values) > SMOOTH_WINDOW:
-            left_values.pop(0)
-            right_values.pop(0)
+            # Neue Werte in die Glättungspuffer aufnehmen
+            left_values.append(left)
+            right_values.append(right)
 
-        # Gleitenden Mittelwert berechnen
-        left_avg  = sum(left_values) / len(left_values)
-        right_avg = sum(right_values) / len(right_values)
+            # Puffer auf SMOOTH_WINDOW begrenzen (älteste Werte entfernen)
+            if len(left_values) > SMOOTH_WINDOW:
+                left_values.pop(0)
+                right_values.pop(0)
+
+            # Gleitenden Mittelwert berechnen
+            left_avg  = sum(left_values) / len(left_values)
+            right_avg = sum(right_values) / len(right_values)
 
         # =================================================
         # KAMERA / KI
