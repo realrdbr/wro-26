@@ -1,0 +1,498 @@
+"""
+WRO 2026 - Future Engineers - Fischertechnik TXT 4.0
+Autonomes Fahrzeug: Hindernisrennen mit KI-Erkennung
+
+FINALE WETTBEWERBSVERSION (Optimiert):
+  - Kamera-Inferenz in separaten Thread ausgelagert
+  - NEU: I2C-Bus-Spamming-Schutz (Hardware-Befehle nur bei Wertänderung)
+  - NEU: Filter-Absicherung gegen voreiligen Kurvenausgang (5-Frame-Debounce)
+  - Beibehalten: Automatische Richtungserkennung beim Start (reglementkonform)
+  - Beibehalten: Radikaler Puffer-Reset nach Kurven zur Filter-Bereinigung
+"""
+
+import time
+import sys
+import cv2
+import numpy as np
+import threading
+
+from fischertechnik.controller.Motor import Motor
+from lib.controller import *
+
+try:
+    import tensorflow.lite as tflite
+except ImportError:
+    import tflite_runtime.interpreter as tflite
+
+
+# =========================================================
+# KONSTANTEN UND EINSTELLUNGEN
+# =========================================================
+
+# --- Lenkung (Servo) ---
+CENTER               = 282    
+MIN_STEERING         = 182    
+MAX_STEERING         = 382    
+WALL_STEER_MAX_OFFSET = 90     
+
+# --- Motor ---
+NORMAL_SPEED   = 267   
+CURVE_SPEED    = 195   
+SLOW_SPEED     = 100   
+
+# --- Kamera & KI ---
+CAMERA_WIDTH  = 320
+CAMERA_HEIGHT = 240
+DETECTION_THRESHOLD = 0.70   
+
+# --- Label-Mapping ---
+LABEL_GREEN  = "0 Gruen"    
+LABEL_RED    = "1 Rot"       
+LABEL_ROSA   = "2 Rosa"     
+LABEL_LINE   = "3 Linien"   
+LABEL_EMPTY  = "4 Leer"     
+
+# --- Manöver-Timing & Absicherung (Sekunden) ---
+BLOCK_TURN_MIN_DURATION = 0.45    
+BLOCK_TURN_MAX_DURATION = 3.0    
+CURVE_TURN_MIN_DURATION = 1.20   
+CURVE_TURN_MAX_DURATION = 4.5    
+STRAIGHTEN_DURATION     = 0.65   
+TURN_COOLDOWN           = 1.20   
+
+# --- Wandverfolgung ---
+WALL_TARGET_DISTANCE   = 50.0   
+WALL_TOLERANCE         = 6.0    
+WALL_KP                = 4      
+WALL_MIN               = 5      
+WALL_MAX               = 200    
+WALL_CORRECTION_DURATION = 0.10  
+WALL_STRAIGHT_DURATION   = 0.08  
+
+# --- Sensorglättung & Taktung ---
+SMOOTH_WINDOW = 5              
+SENSOR_SAMPLE_INTERVAL = 0.010  
+EXIT_DEBOUNCE_FRAMES = 5         # Wie viele Zyklen die Spur stabil sein muss für den Ausgang
+
+# --- Ultraschall-Schwellen ---
+LINE_TURN_DECISION_GAP = 5.0   
+CURVE_DISTANCE_THRESHOLD = 65  
+
+
+# =========================================================
+# ZUSTANDSDEFINITIONEN
+# =========================================================
+STATE_STRAIGHT       = "GERADEAUS"         
+STATE_BLOCK_AVOID    = "BLOCK_AUSWEICHEN"  
+STATE_CURVE          = "KURVE_FAHREN"      
+STATE_STRAIGHTEN     = "NACHLENKEN"        
+STATE_WALL_CORRECT   = "WAND_KORREKTUR"    
+STATE_WALL_STABILIZE = "WAND_STABILISIEREN"
+STATE_STOPPED        = "GESTOPPT"          
+
+
+# =========================================================
+# TRACKER FÜR HARDWARE-SCHUTZ (PUNKT 1)
+# =========================================================
+current_hw_speed = None
+current_hw_dir = None
+current_hw_steering = None
+
+def set_motor_speed_safe(speed, direction=Motor.CCW):
+    """Sendet den Befehl nur an den TXT 4.0, wenn sich der Wert geändert hat."""
+    global current_hw_speed, current_hw_dir
+    speed = int(speed)
+    if speed != current_hw_speed or direction != current_hw_dir:
+        TXT_M_M1_encodermotor.set_speed(speed, direction)
+        current_hw_speed = speed
+        current_hw_dir = direction
+
+def set_steering_safe(position):
+    """Sendet den Lenkbefehl nur bei echter Positionsänderung."""
+    global current_hw_steering
+    position = int(position)
+    if position != current_hw_steering:
+        TXT_M_S1_servomotor.set_position(position)
+        current_hw_steering = position
+
+
+# =========================================================
+# KI & KAMERA THREAD
+# =========================================================
+class CameraThread(threading.Thread):
+    def __init__(self, model_path, label_path):
+        threading.Thread.__init__(self)
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        with open(label_path, "r") as f:
+            self.labels = [line.strip() for line in f.readlines()]
+            
+        # Nutzt 2 Kerne, um dem Haupt-Thread genug Echtzeit-Kapazität zu lassen
+        self.interpreter = tflite.Interpreter(model_path=model_path, num_threads=2)
+        self.interpreter.allocate_tensors()
+        self.input_details = self.interpreter.get_input_details()
+        self.input_shape = self.input_details[0]["shape"]
+        self.height = self.input_shape[1]
+        self.width = self.input_shape[2]
+        self.input_index = self.input_details[0]["index"]
+        self.input_dtype = self.input_details[0]["dtype"]
+        self.scale, self.zero_point = self.input_details[0]["quantization"]
+        
+        self.best_label = LABEL_EMPTY
+        self.best_score = 0.0
+        self.running = True
+        self.lock = threading.Lock()
+
+    def run(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+                
+            image = cv2.resize(frame, (self.width, self.height))
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            if self.input_dtype == np.float32:
+                image = image.astype(np.float32) / 255.0
+            elif self.input_dtype == np.int8:
+                image = (image / self.scale + self.zero_point).astype(np.int8)
+            elif self.input_dtype == np.uint8:
+                image = image.astype(np.uint8)
+
+            input_data = np.expand_dims(image, axis=0)
+            self.interpreter.set_tensor(self.input_index, input_data)
+            self.interpreter.invoke()
+
+            output_details = self.interpreter.get_output_details()
+            output_data = self.interpreter.get_tensor(output_details[0]["index"])
+
+            if output_details[0]["dtype"] in [np.int8, np.uint8]:
+                output_scale, output_zero_point = output_details[0]["quantization"]
+                output_data = (output_data.astype(np.float32) - output_zero_point) * output_scale
+
+            output_data = np.squeeze(output_data)
+            top_id = output_data.argsort()[-1]
+            
+            with self.lock:
+                self.best_label = self.labels[top_id]
+                self.best_score = float(output_data[top_id])
+                
+        self.cap.release()
+
+    def get_prediction(self):
+        with self.lock:
+            return self.best_label, self.best_score
+
+    def stop(self):
+        self.running = False
+
+
+# =========================================================
+# HILFSFUNKTIONEN: FILTER UND LENKUNG
+# =========================================================
+def median_filter(values):
+    if not values:
+        return 0.0
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    mid = n // 2
+    return (sorted_vals[mid - 1] + sorted_vals[mid]) / 2.0 if n % 2 == 0 else float(sorted_vals[mid])
+
+def clamp_sensor(value):
+    if value <= 0: return float(WALL_MIN)
+    if value > WALL_MAX: return float(WALL_MAX)
+    return float(value)
+
+def reject_outlier(new_val, buffer, max_jump=35):
+    if len(buffer) < 3: return new_val
+    med = median_filter(buffer)
+    return med if abs(new_val - med) > max_jump else new_val
+
+def clamp_steering(value):
+    return int(max(MIN_STEERING, min(value, MAX_STEERING)))
+
+def steer_towards(direction, intensity):
+    intensity = max(0.0, min(intensity, 1.0))
+    if direction == "left":
+        return clamp_steering(CENTER + int((MAX_STEERING - CENTER) * intensity))
+    else:
+        return clamp_steering(CENTER - int((CENTER - MIN_STEERING) * intensity))
+
+
+# =========================================================
+# HAUPTFUNKTION
+# =========================================================
+def main(argv):
+    print("=== WRO 2026 - PRODUCTION READY START ===")
+
+    model_path = "/opt/ft/workspaces/model.tflite"
+    label_path = "/opt/ft/workspaces/labels.txt"
+    
+    print("Starte Kamera-Inferenz-Thread...")
+    cam_thread = CameraThread(model_path, label_path)
+    cam_thread.start()
+    time.sleep(1.0) 
+
+    # Initial-Zustand über sichere Funktionen setzen
+    set_steering_safe(CENTER)
+    set_motor_speed_safe(NORMAL_SPEED, Motor.CCW)
+    
+    state = STATE_STRAIGHT
+
+    left_buffer, right_buffer = [], []
+    left_avg, right_avg = 50.0, 50.0
+
+    last_sensor_time = time.time()
+    state_start_time = time.time()   
+    last_turn_time = 0.0           
+    state_timeout = 0.0           
+
+    drive_direction = None
+    current_turn_dir = None   
+    last_correction_dir = None
+
+    # KI Filter-Variablen (Debounce)
+    confirm_label = ""
+    confirm_count = 0
+    confirmed_label = ""
+    ki_miss_frames = 0
+    KI_MAX_MISS_FRAMES = 2 
+
+    # Absicherung des Kurvenausgangs (Punkt 3)
+    exit_confirm_counter = 0
+
+    # Rundenzählung setup
+    sections_completed = 0   
+    TOTAL_SECTIONS = 24  
+    loop_counter = 0
+
+    print("System startbereit.")
+
+    try:
+        while True:
+            now = time.time()
+            loop_counter += 1
+
+            # -------------------------------------------------
+            # 1. SENSORIK: ULTRASCHALL ABTASTEN & FILTERN
+            # -------------------------------------------------
+            if now - last_sensor_time >= SENSOR_SAMPLE_INTERVAL:
+                last_sensor_time = now
+                raw_left  = clamp_sensor(TXT_M_I1_ultrasonic_distance_meter.get_distance())
+                raw_right = clamp_sensor(TXT_M_I2_ultrasonic_distance_meter.get_distance())
+
+                raw_left  = reject_outlier(raw_left, left_buffer)
+                raw_right = reject_outlier(raw_right, right_buffer)
+
+                left_buffer.append(raw_left)
+                right_buffer.append(raw_right)
+
+                if len(left_buffer) > SMOOTH_WINDOW: left_buffer.pop(0)
+                if len(right_buffer) > SMOOTH_WINDOW: right_buffer.pop(0)
+
+                left_avg  = median_filter(left_buffer)
+                right_avg = median_filter(right_buffer)
+
+            # -------------------------------------------------
+            # 2. KI: AUSLESEN AUS THREAD & DEBOUNCE
+            # -------------------------------------------------
+            best_label, best_score = cam_thread.get_prediction()
+
+            if best_score >= DETECTION_THRESHOLD and best_label != LABEL_EMPTY:
+                ki_miss_frames = 0 
+                if best_label == confirm_label:
+                    confirm_count += 1
+                else:
+                    confirm_label = best_label
+                    confirm_count = 1
+
+                needed = 1 if best_label == LABEL_LINE else 2
+                if confirm_count >= needed:
+                    confirmed_label = best_label
+            else:
+                if state == STATE_STRAIGHT:
+                    ki_miss_frames += 1
+                    if ki_miss_frames > KI_MAX_MISS_FRAMES:
+                        confirm_count = 0
+                        confirm_label = ""
+                        confirmed_label = ""
+
+            # -------------------------------------------------
+            # 3. ZUSTANDSMASCHINE (STATE MACHINE)
+            # -------------------------------------------------
+            
+            # --- GESTOPPT ---
+            if state == STATE_STOPPED:
+                set_motor_speed_safe(0, Motor.CCW)
+                set_steering_safe(CENTER)
+                time.sleep(0.2)
+                continue
+
+            # --- GERADEAUS (Wandverfolgung) ---
+            elif state == STATE_STRAIGHT:
+                set_motor_speed_safe(NORMAL_SPEED, Motor.CCW)
+                cooldown_ok = (now - last_turn_time) > TURN_COOLDOWN
+
+                if cooldown_ok and confirmed_label != "":
+                    # Punkt 2: Automatische Richtungserkennung bleibt aktiv da reglementkonform
+                    if drive_direction is None and confirmed_label == LABEL_LINE:
+                        if left_avg > CURVE_DISTANCE_THRESHOLD: drive_direction = "ccw"
+                        elif right_avg > CURVE_DISTANCE_THRESHOLD: drive_direction = "cw"
+
+                    # ÜBERGANG: REAKTION AUF BLÖCKE
+                    if confirmed_label in [LABEL_RED, LABEL_GREEN]:
+                        current_turn_dir = "right" if confirmed_label == LABEL_RED else "left"
+                        print(f">>> BLOCK DETEKTIERT -> AUSWEICHEN {current_turn_dir.upper()}")
+                        state = STATE_BLOCK_AVOID
+                        state_start_time = now
+                        state_timeout = now + BLOCK_TURN_MAX_DURATION
+                        exit_confirm_counter = 0  # Counter resetten
+                        confirmed_label = ""
+
+                    # ÜBERGANG: REAKTION AUF LINIE (KURVE)
+                    elif confirmed_label == LABEL_LINE:
+                        if drive_direction == "cw": current_turn_dir = "right"
+                        elif drive_direction == "ccw": current_turn_dir = "left"
+                        else: current_turn_dir = "left" if (left_avg - right_avg) > 0 else "right"
+
+                        sections_completed += 1
+                        print(f">>> LINIE MATCHED -> STARTE KURVE {current_turn_dir.upper()} (Segment: {sections_completed})")
+                        
+                        if sections_completed >= TOTAL_SECTIONS:
+                            state = STATE_STOPPED
+                            print("=== ZIEL ERREICHT -> FAHRZEUG STOPPT ===")
+                            continue
+
+                        state = STATE_CURVE
+                        state_start_time = now
+                        state_timeout = now + CURVE_TURN_MAX_DURATION
+                        exit_confirm_counter = 0  # Counter resetten
+                        confirmed_label = ""
+
+                # Wandverfolgung
+                if state == STATE_STRAIGHT:
+                    error = left_avg - right_avg
+                    if abs(error) < WALL_TOLERANCE:
+                        set_steering_safe(CENTER)
+                    else:
+                        correction = int(error * WALL_KP)
+                        correction = max(-WALL_STEER_MAX_OFFSET, min(correction, WALL_STEER_MAX_OFFSET))
+                        steering = clamp_steering(CENTER + correction)
+                        last_correction_dir = "left" if correction > 0 else "right"
+                        
+                        set_steering_safe(steering)
+                        state = STATE_WALL_CORRECT
+                        state_start_time = now
+                        state_timeout = now + WALL_CORRECTION_DURATION
+
+            # --- WANDKORREKTUR ---
+            elif state == STATE_WALL_CORRECT:
+                if now > state_timeout:
+                    state = STATE_WALL_STABILIZE
+                    state_start_time = now
+                    state_timeout = now + WALL_STRAIGHT_DURATION
+
+            # --- WAND STABILISIEREN ---
+            elif state == STATE_WALL_STABILIZE:
+                steering = clamp_steering(CENTER - 10 if last_correction_dir == "left" else CENTER + 10)
+                set_steering_safe(steering)
+
+                if now > state_timeout:
+                    set_steering_safe(CENTER)
+                    state = STATE_STRAIGHT
+                    last_correction_dir = None
+
+            # --- BLOCK AUSWEICHEN ---
+            elif state == STATE_BLOCK_AVOID:
+                set_motor_speed_safe(CURVE_SPEED, Motor.CCW)
+                
+                intensity = max(0.4, min((best_score - DETECTION_THRESHOLD) / (1.0 - DETECTION_THRESHOLD + 0.01), 1.0)) if best_label in [LABEL_RED, LABEL_GREEN] else 0.85
+                steering = steer_towards(current_turn_dir, intensity)
+                set_steering_safe(steering)
+
+                min_time_passed = (now - state_start_time) > BLOCK_TURN_MIN_DURATION
+                track_cleared = (left_avg < CURVE_DISTANCE_THRESHOLD and right_avg < CURVE_DISTANCE_THRESHOLD)
+
+                # Punkt 3: Filter-Absicherung gegen voreiligen Abbruch
+                if track_cleared and min_time_passed:
+                    exit_confirm_counter += 1
+                else:
+                    exit_confirm_counter = 0
+
+                if exit_confirm_counter >= EXIT_DEBOUNCE_FRAMES or now > state_timeout:
+                    print(">> Hindernis erfolgreich umfahren -> Stabilisierung")
+                    state = STATE_STRAIGHTEN
+                    state_start_time = now
+                    state_timeout = now + STRAIGHTEN_DURATION
+                    last_turn_time = now
+                    last_correction_dir = current_turn_dir
+
+            # --- KURVE FAHREN ---
+            elif state == STATE_CURVE:
+                set_motor_speed_safe(CURVE_SPEED, Motor.CCW)
+                steering = steer_towards(current_turn_dir, 0.92) 
+                set_steering_safe(steering)
+
+                min_time_passed = (now - state_start_time) > CURVE_TURN_MIN_DURATION
+                track_found = (left_avg < CURVE_DISTANCE_THRESHOLD and right_avg < CURVE_DISTANCE_THRESHOLD)
+
+                # Punkt 3: Erst wenn die Spur über mehrere Frames stabil ist, wird abgebrochen
+                if track_found and min_time_passed:
+                    exit_confirm_counter += 1
+                else:
+                    exit_confirm_counter = 0
+
+                if exit_confirm_counter >= EXIT_DEBOUNCE_FRAMES or now > state_timeout:
+                    print(">> Kurvenausgang stabil erkannt -> Spurausgleich")
+                    state = STATE_STRAIGHTEN
+                    state_start_time = now
+                    state_timeout = now + STRAIGHTEN_DURATION
+                    last_turn_time = now
+                    last_correction_dir = current_turn_dir
+
+            # --- NACHLENKEN ---
+            elif state == STATE_STRAIGHTEN:
+                set_motor_speed_safe(NORMAL_SPEED, Motor.CCW)
+                opposite = "right" if last_correction_dir == "left" else "left"
+                
+                if (now - state_start_time) < (STRAIGHTEN_DURATION * 0.5):
+                    steering = steer_towards(opposite, 0.28) 
+                else:
+                    steering = CENTER
+
+                set_steering_safe(steering)
+
+                if now > state_timeout:
+                    set_steering_safe(CENTER)
+                    state = STATE_STRAIGHT
+                    
+                    # Punkt 4: Gewollter radikaler Reset, um Freiräume/Sackgassen auszublenden
+                    left_buffer.clear()
+                    right_buffer.clear()
+                    confirmed_label = ""
+                    confirm_count = 0
+
+            # -------------------------------------------------
+            # 4. TELEMETRIE-AUSGABE
+            # -------------------------------------------------
+            if loop_counter % 20 == 0:
+                runden = sections_completed // 8
+                rest   = sections_completed % 8
+                dir_str = str(drive_direction) if drive_direction else "UNBEKANNT"
+                print(f"L:{round(left_avg,1)} R:{round(right_avg,1)} | KI: {best_label} ({round(best_score,2)}) | State: {state} | Lap: {runden}+{rest} | Dir: {dir_str}")
+
+            time.sleep(0.015) 
+
+    finally:
+        print("Schließe Threads und stoppe Triebwerke...")
+        cam_thread.stop()
+        cam_thread.join()
+        TXT_M_M1_encodermotor.set_speed(0, Motor.CCW)
+        TXT_M_S1_servomotor.set_position(int(CENTER))
+
+
+if __name__ == "__main__":
+    main(sys.argv)
